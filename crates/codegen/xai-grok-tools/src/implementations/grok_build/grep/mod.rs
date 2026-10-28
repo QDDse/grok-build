@@ -41,6 +41,7 @@ mod rg_heading;
 mod rg_runner;
 pub mod ripgrep;
 
+pub(crate) use crate::implementations::grok_build::grep::card::trim_line;
 pub use crate::implementations::grok_build::grep::card::{
     count_matches, format_content_output, format_count_output, format_files_with_matches_output,
     parse_file_matches, parse_numbered_line_prefix,
@@ -589,6 +590,115 @@ fn grep_progress_stream(
     })
 }
 
+/// Raw, path-sorted grep output for the hashline renderer. The shared grep
+/// preparation still enforces root resolution, ignore globs and read policy.
+pub(crate) struct RawSortedGrepOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) exit_code: i32,
+    pub(crate) cwd_display: String,
+    pub(crate) max_chars_per_line: usize,
+    pub(crate) default_max_output_bytes: usize,
+}
+
+impl RawSortedGrepOutput {
+    pub(crate) fn into_standard(self, input: &GrepSearchInput) -> GrepSearchOutput {
+        let output_mode = input.output_mode.clone().unwrap_or(OutputMode::Content);
+        let config = GrepFormatConfig {
+            effective_head_limit: resolve_effective_head_limit(input, &output_mode),
+            output_mode,
+            max_chars_per_line: self.max_chars_per_line,
+            max_output_bytes: self.default_max_output_bytes,
+            cwd_display: self.cwd_display,
+        };
+        finalize_grep(
+            self.stdout,
+            self.truncated,
+            self.stderr,
+            self.exit_code,
+            &config,
+        )
+    }
+}
+
+pub(crate) enum RawSortedGrepResult {
+    Early(GrepSearchOutput),
+    Raw(RawSortedGrepOutput),
+}
+
+impl GrepTool {
+    /// Use the same ripgrep runner with path sorting and the existing 5 MB raw
+    /// safety bound. No line or card budget is applied before hashline selection.
+    pub(crate) async fn run_raw_sorted(
+        &self,
+        ctx: &xai_tool_runtime::ToolCallContext,
+        input: &GrepSearchInput,
+    ) -> Result<RawSortedGrepResult, xai_tool_runtime::ToolError> {
+        let GrepReady { source, mut config } =
+            match prepare_grep_with_options(ctx, input, true).await? {
+                GrepStep::Early(out) => return Ok(RawSortedGrepResult::Early(out)),
+                GrepStep::Ready(ready) => ready,
+            };
+        let default_max_output_bytes = config.max_output_bytes;
+        config.effective_head_limit = usize::MAX;
+        config.max_output_bytes = usize::MAX;
+        let (mut rg, deadline) = match source.resolve(&config, &tracing::Span::current()).await {
+            ResolvedSource::Rg { rg, deadline } => (rg, deadline),
+            ResolvedSource::Answered(_) => unreachable!("sorted grep does not use search offers"),
+            ResolvedSource::SpawnFailed(out) => return Ok(RawSortedGrepResult::Early(out)),
+        };
+        let mut output = CappedOutput::new(&config);
+        let io_result = tokio::time::timeout_at(deadline, async {
+            let truncated = loop {
+                let Some(chunk) = rg.read_stdout().await else {
+                    break false;
+                };
+                match output.accept(chunk).fill {
+                    Fill::Open => {}
+                    Fill::Overflowed => break true,
+                    Fill::FullAtChunkEnd => break rg.has_more_stdout().await,
+                }
+            };
+            if truncated {
+                rg.stop();
+            }
+            let mut stderr = Vec::new();
+            rg.drain_stderr(&mut stderr).await;
+            (truncated, stderr)
+        })
+        .await;
+        let (truncated, stderr) = match io_result {
+            Ok(result) => result,
+            Err(_) => {
+                rg.kill_and_reap().await;
+                return Ok(RawSortedGrepResult::Early(grep_timeout_output(
+                    grep_timeout().as_secs(),
+                )));
+            }
+        };
+        let exit_code = rg.exit_code(truncated).await;
+        if exit_code != 0 && exit_code != 1 {
+            return Ok(RawSortedGrepResult::Early(finalize_grep(
+                output.into_bytes(),
+                truncated,
+                stderr,
+                exit_code,
+                &config,
+            )));
+        }
+        Ok(RawSortedGrepResult::Raw(RawSortedGrepOutput {
+            stdout: output.into_bytes(),
+            truncated,
+            stderr,
+            exit_code,
+            cwd_display: config.cwd_display,
+            max_chars_per_line: config.max_chars_per_line,
+            default_max_output_bytes,
+        }))
+    }
+}
+
 /// A spawned ripgrep or an offered search, plus the resolved formatting config.
 struct GrepReady {
     source: GrepSource,
@@ -608,6 +718,14 @@ enum GrepStep {
 async fn prepare_grep(
     ctx: &xai_tool_runtime::ToolCallContext,
     input: &GrepSearchInput,
+) -> Result<GrepStep, xai_tool_runtime::ToolError> {
+    prepare_grep_with_options(ctx, input, false).await
+}
+
+async fn prepare_grep_with_options(
+    ctx: &xai_tool_runtime::ToolCallContext,
+    input: &GrepSearchInput,
+    sort_by_path: bool,
 ) -> Result<GrepStep, xai_tool_runtime::ToolError> {
     use crate::types::tool_metadata::{resolve_cwd, shared_resources};
     let resources = shared_resources(ctx)?;
@@ -704,12 +822,16 @@ async fn prepare_grep(
         output_mode: &output_mode,
         root: &workdir,
         globs: &globs,
+        sort_by_path,
     };
-    let offer = file_system.and_then(|file_system| {
-        let request = content_search_request(&args, root_kind, effective_head_limit)?;
-        let job = file_system.offer_content_search(&request)?;
-        Some((job, request))
-    });
+    let offer = (!sort_by_path)
+        .then_some(file_system)
+        .flatten()
+        .and_then(|file_system| {
+            let request = content_search_request(&args, root_kind, effective_head_limit)?;
+            let job = file_system.offer_content_search(&request)?;
+            Some((job, request))
+        });
     let rg_command = args.into_command();
     let source = match offer {
         Some((job, request)) => GrepSource::Offered {

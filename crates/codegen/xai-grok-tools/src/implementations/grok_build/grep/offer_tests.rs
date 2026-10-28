@@ -564,6 +564,7 @@ async fn failed_job_leaves_rg_the_rest_of_the_deadline() {
         output_mode: &output_mode,
         root: tree.path(),
         globs: &[],
+        sort_by_path: false,
     };
     let mut request = content_search_request(&args, RootKind::Directory, 10).unwrap();
     request.deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);

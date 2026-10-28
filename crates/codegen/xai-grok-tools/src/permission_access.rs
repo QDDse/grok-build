@@ -16,6 +16,10 @@ impl From<&crate::types::ToolInput> for AccessKind {
                 path: g.path.clone(),
                 glob: g.glob.clone(),
             },
+            ToolInput::HashlineGrep(g) => AccessKind::Grep {
+                path: g.grep.path.clone(),
+                glob: g.grep.glob.clone(),
+            },
             ToolInput::CodexGrepFiles(g) => AccessKind::Grep {
                 path: g.path.clone(),
                 glob: g.include.clone(),
@@ -118,6 +122,19 @@ fn access_kind_from_dynamic(value: &serde_json::Value) -> AccessKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hashline_grep_maps_to_grep_access_with_path_and_glob() {
+        use crate::implementations::grok_build_hashline::grep::HashlineGrepInput;
+        use crate::types::ToolInput;
+        let input: HashlineGrepInput = serde_json::from_value(serde_json::json!({
+            "pattern": "needle", "path": "src", "glob": "*.rs", "max_matches": 2
+        }))
+        .unwrap();
+        let access = AccessKind::from(&ToolInput::HashlineGrep(input));
+        assert!(
+            matches!(access, AccessKind::Grep { path: Some(ref p), glob: Some(ref g) } if p == "src" && g == "*.rs")
+        );
+    }
     #[test]
     fn hashline_edit_maps_to_edit_access() {
         use crate::implementations::grok_build_hashline::edit::types::HashlineEditInput;

@@ -58,6 +58,7 @@ pub enum ToolInput {
     SearchReplace(SearchReplaceInput),
     Bash(BashToolInput),
     Grep(GrepSearchInput),
+    HashlineGrep(crate::implementations::grok_build_hashline::grep::HashlineGrepInput),
     ListDir(ListDirInput),
     TodoWrite(TodoWriteInput),
     Skill(SkillInput),

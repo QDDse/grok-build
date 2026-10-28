@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::computer::types::AsyncFileSystem;
-use crate::implementations::grok_build::grep::{GrepSearchInput, GrepTool, OutputMode};
+use crate::implementations::grok_build::grep::{
+    GrepParams, GrepSearchInput, GrepTool, OutputMode, RawSortedGrepResult,
+};
 
-use crate::types::output::GrepSearchOutput;
+use crate::types::output::{GrepFileMatch, GrepLineMatch, GrepSearchOutput};
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::Params;
 use crate::types::tool::{ToolKind, ToolNamespace};
@@ -42,6 +44,7 @@ async fn get_or_generate<'a>(
 /// Inject anchors into ripgrep content-mode output. Transforms lines like `123: let x = 1;` or
 /// `124- let y = 2;` into `123:abc:rst: let x = 1;` or `124:abc:rst- let y = 2;`. Lines that are
 /// file headers or separators pass through unchanged.
+#[cfg(test)]
 pub(crate) async fn inject_anchors(
     stdout_bytes: &[u8],
     cwd: &Path,
@@ -135,6 +138,387 @@ fn parse_rg_line(line: &str) -> Option<(usize, char, &str)> {
     Some((num, sep, line.get(idx + 1..)?))
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct HashlineGrepInput {
+    #[serde(flatten)]
+    pub grep: GrepSearchInput,
+    /// Maximum number of matching lines, independent of file headers and context.
+    /// When present, this takes precedence over the legacy raw-line `head_limit`.
+    #[schemars(
+        description = "Maximum matching lines, excluding headers and context. Takes precedence over head_limit; capped at 2000."
+    )]
+    pub max_matches: Option<usize>,
+    /// Hard limit for the complete final stdout, including anchors and wrapper.
+    pub max_output_bytes: Option<usize>,
+}
+
+struct RawLine {
+    number: usize,
+    separator: char,
+    content: String,
+}
+
+struct SearchFile {
+    path: String,
+    lines: Vec<RawLine>,
+}
+
+struct DisplayLine {
+    number: usize,
+    is_match: bool,
+    content: String,
+    rendered: String,
+}
+
+struct DisplayFile {
+    path: String,
+    lines: Vec<DisplayLine>,
+}
+
+fn parse_search_files(raw: &[u8]) -> Vec<SearchFile> {
+    let mut files: Vec<SearchFile> = Vec::new();
+    let text = String::from_utf8_lossy(raw);
+    let mut current: Option<usize> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            current = None;
+        } else if line == "--" {
+            continue;
+        } else if let Some(index) = current {
+            if let Some((number, separator, content)) = parse_rg_line(line) {
+                if let Some(file) = files.get_mut(index) {
+                    file.lines.push(RawLine {
+                        number,
+                        separator,
+                        content: content.to_owned(),
+                    });
+                }
+            } else {
+                files.push(SearchFile {
+                    path: line.to_owned(),
+                    lines: Vec::new(),
+                });
+                current = Some(files.len() - 1);
+            }
+        } else {
+            files.push(SearchFile {
+                path: line.to_owned(),
+                lines: Vec::new(),
+            });
+            current = Some(files.len() - 1);
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    for file in &mut files {
+        file.lines
+            .sort_by_key(|line| (line.number, line.separator != ':'));
+        file.lines.dedup_by_key(|line| line.number);
+    }
+    files
+}
+
+fn render_card(
+    files: &[DisplayFile],
+    cwd_display: &str,
+    match_cap: usize,
+    context_cap: usize,
+    observed_matches: usize,
+    raw_truncated: bool,
+    before: usize,
+    after: usize,
+) -> (String, Vec<GrepFileMatch>, usize) {
+    let mut body = String::new();
+    let mut structured = Vec::new();
+    let mut visible = 0;
+    let mut context_seen = 0;
+    for file in files {
+        let retained: Vec<usize> = file
+            .lines
+            .iter()
+            .filter(|line| line.is_match)
+            .map(|line| line.number)
+            .take(match_cap.saturating_sub(visible))
+            .collect();
+        if retained.is_empty() {
+            continue;
+        }
+        let mut file_body = String::new();
+        let mut matches = Vec::new();
+        let mut previous_number: Option<usize> = None;
+        for line in &file.lines {
+            let included_match = line.is_match && retained.contains(&line.number);
+            let within_context = !line.is_match
+                && retained.iter().any(|&number| {
+                    line.number >= number.saturating_sub(before)
+                        && line.number <= number.saturating_add(after)
+                });
+            let included_context = if within_context {
+                let include = context_seen < context_cap;
+                context_seen += 1;
+                include
+            } else {
+                false
+            };
+            if !included_match && !included_context {
+                continue;
+            }
+            if !file_body.is_empty() {
+                file_body.push('\n');
+            }
+            if previous_number.is_some_and(|previous| line.number > previous.saturating_add(1)) {
+                file_body.push_str("--\n");
+            }
+            file_body.push_str(&line.rendered);
+            previous_number = Some(line.number);
+            if included_match {
+                visible += 1;
+                matches.push(GrepLineMatch {
+                    line_number: line.number,
+                    content: line.content.clone(),
+                });
+            }
+        }
+        if !matches.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&file.path);
+            body.push('\n');
+            body.push_str(&file_body);
+            structured.push(GrepFileMatch {
+                path: file.path.clone(),
+                matches,
+            });
+        }
+    }
+    let omitted = observed_matches.saturating_sub(visible);
+    let summary = if observed_matches == 0 && !raw_truncated {
+        "No matches found".to_owned()
+    } else if omitted == 0 && !raw_truncated {
+        format!("Found {visible} matching lines")
+    } else if raw_truncated {
+        format!("Showing {visible} of at least {observed_matches} matching lines")
+    } else {
+        format!("Showing {visible} of {observed_matches} matching lines")
+    };
+    let footer = if raw_truncated {
+        if omitted > 0 {
+            format!("... [at least {omitted} matching lines omitted] ...")
+        } else {
+            "... [raw search truncated; more matches may exist] ...".to_owned()
+        }
+    } else if omitted > 0 {
+        format!(
+            "... [{omitted} matching line{} omitted] ...",
+            if omitted == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let mut card = format!("<workspace_result workspace_path=\"{cwd_display}\">\n{summary}");
+    if !body.is_empty() {
+        card.push('\n');
+        card.push_str(&body);
+    }
+    if !footer.is_empty() {
+        card.push('\n');
+        card.push_str(&footer);
+    }
+    card.push_str("\n</workspace_result>");
+    (card, structured, visible)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_budgeted_content(
+    raw: &[u8],
+    raw_truncated: bool,
+    cwd: &Path,
+    cwd_display: &str,
+    fs: &dyn AsyncFileSystem,
+    scheme: &dyn AnchorScheme,
+    max_matches: usize,
+    budget: usize,
+    max_chars_per_line: usize,
+    before: usize,
+    after: usize,
+) -> GrepSearchOutput {
+    // A raw safety cap may stop inside a numbered line. Never turn that
+    // partial fragment into a visible, anchored match.
+    let raw = if raw_truncated && !raw.ends_with(b"\n") {
+        raw.iter()
+            .rposition(|&byte| byte == b'\n')
+            .and_then(|index| raw.get(..=index))
+            .unwrap_or(&[])
+    } else {
+        raw
+    };
+    let mut files = Vec::new();
+    let mut cache = HashMap::new();
+    let mut selected = 0;
+    let mut observed = 0;
+    for file in parse_search_files(raw) {
+        let matching = file
+            .lines
+            .iter()
+            .filter(|line| line.separator == ':')
+            .count();
+        observed += matching;
+        if selected >= max_matches || matching == 0 {
+            continue;
+        }
+        let path = cwd.join(&file.path);
+        let Some(anchors) = get_or_generate(&mut cache, &path, scheme, fs).await else {
+            continue;
+        };
+        let mut lines = Vec::new();
+        for line in file.lines {
+            if line.separator == ':' && selected >= max_matches {
+                continue;
+            }
+            let Some(anchor) = line
+                .number
+                .checked_sub(1)
+                .and_then(|index| anchors.get(index))
+            else {
+                continue;
+            };
+            let anchor_text = match &anchor.context {
+                Some(context) => format!("{}:{context}", anchor.local),
+                None => anchor.local.clone(),
+            };
+            let content = crate::implementations::grok_build::grep::trim_line(
+                &line.content,
+                max_chars_per_line,
+            );
+            let is_match = line.separator == ':';
+            if is_match {
+                selected += 1;
+            }
+            lines.push(DisplayLine {
+                number: line.number,
+                is_match,
+                rendered: format!("{}:{anchor_text}{}{content}", line.number, line.separator),
+                content,
+            });
+        }
+        if lines.iter().any(|line| line.is_match) {
+            files.push(DisplayFile {
+                path: file.path,
+                lines,
+            });
+        }
+    }
+
+    let fit = |match_cap, context_cap| {
+        render_card(
+            &files,
+            cwd_display,
+            match_cap,
+            context_cap,
+            observed,
+            raw_truncated,
+            before,
+            after,
+        )
+    };
+    let all_contexts = files
+        .iter()
+        .map(|file| file.lines.iter().filter(|line| !line.is_match).count())
+        .sum();
+    let (mut card, mut structured, mut visible) = fit(selected, all_contexts);
+    if card.len() > budget {
+        let (no_context, _, _) = fit(selected, 0);
+        if no_context.len() <= budget {
+            let mut low = 0;
+            let mut high = all_contexts;
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if fit(selected, mid).0.len() <= budget {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            (card, structured, visible) = fit(selected, low);
+        } else {
+            let mut low = 0;
+            let mut high = selected;
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if fit(mid, 0).0.len() <= budget {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            (card, structured, visible) = fit(low, 0);
+        }
+    }
+    let too_small = card.len() > budget;
+    let stdout = if !too_small {
+        card.into_bytes()
+    } else if budget >= "[truncated]".len() {
+        b"[truncated]".to_vec()
+    } else if budget > 0 {
+        b"!".to_vec()
+    } else {
+        Vec::new()
+    };
+    if stdout == b"[truncated]" || stdout == b"!" || stdout.is_empty() {
+        structured.clear();
+        visible = 0;
+    }
+    GrepSearchOutput {
+        stdout,
+        stderr: if too_small {
+            b"Hashline stdout budget is too small for a complete result card.".to_vec()
+        } else {
+            Vec::new()
+        },
+        exit_code: 0,
+        match_count: visible,
+        file_matches: structured,
+    }
+}
+
+fn enforce_stdout_budget(mut output: GrepSearchOutput, budget: usize) -> GrepSearchOutput {
+    if output.stdout.len() > budget {
+        output.stdout = if budget >= "[truncated]".len() {
+            b"[truncated]".to_vec()
+        } else if budget > 0 {
+            b"!".to_vec()
+        } else {
+            Vec::new()
+        };
+        output.match_count = 0;
+        output.file_matches.clear();
+        if !output.stderr.is_empty() {
+            output.stderr.push(b'\n');
+        }
+        output
+            .stderr
+            .extend_from_slice(b"Hashline stdout budget is too small for a complete result card.");
+    }
+    output
+}
+
+fn legacy_raw_line_limit(raw: &[u8], limit: usize) -> (&[u8], bool) {
+    if limit == 0 {
+        return (&[], !raw.is_empty());
+    }
+    let mut lines = 0;
+    for (index, &byte) in raw.iter().enumerate() {
+        if byte == b'\n' {
+            lines += 1;
+            if lines == limit {
+                let end = index + 1;
+                return (raw.get(..end).unwrap_or(raw), end < raw.len());
+            }
+        }
+    }
+    (raw, false)
+}
+
 const DESCRIPTION: &str = r#"Search file contents with anchor-annotated results${%- if tools.by_kind.edit %} for use with ${{ tools.by_kind.edit }}${%- endif %}.
 
 Match lines include anchors${%- if tools.by_kind.edit %} you can pass directly to ${{ tools.by_kind.edit }}${%- if tools.by_kind.read %} without needing to ${{ tools.by_kind.read }} the file first${%- endif %}${%- endif %}. This grep format keeps grep-style separators after the anchor: `:` for
@@ -149,8 +533,10 @@ Usage:
 - ${{ params.search.pattern }} is a regex: `log.*Error`, `function\s+\w+`, `TODO`
 - Default output is anchored content matches (no output-mode selector)
 - Use -A, -B, -C for context lines around matches
+- Use max_matches to cap matching lines independently of context and headers
+- max_output_bytes caps the complete returned stdout, including paths and anchors
 - Only use '${{ params.search.type }}' or '${{ params.search.glob }}' when certain of the file type
-- Results are capped; truncated results show "at least" counts"#;
+- Results are capped; omitted matches are reported in the output"#;
 
 /// `hashline_grep` — searches with anchor-annotated results.
 #[derive(Debug, Default)]
@@ -201,7 +587,7 @@ impl crate::types::tool_metadata::ToolMetadata for HashlineGrepTool {
 }
 
 impl xai_tool_runtime::Tool for HashlineGrepTool {
-    type Args = GrepSearchInput;
+    type Args = HashlineGrepInput;
     type Output = GrepSearchOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
@@ -234,72 +620,127 @@ impl xai_tool_runtime::Tool for HashlineGrepTool {
     async fn run(
         &self,
         ctx: xai_tool_runtime::ToolCallContext,
-        input: GrepSearchInput,
+        input: HashlineGrepInput,
     ) -> Result<GrepSearchOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
-
-        let output_mode = input.output_mode.clone().unwrap_or(OutputMode::Content);
-
-        // Delegate to standard GrepTool for ripgrep execution.
+        let configured_budget = {
+            let res = resources.lock().await;
+            res.get::<Params<GrepParams>>()
+                .and_then(|params| params.0.max_output_bytes)
+                .unwrap_or(crate::DEFAULT_TOOL_OUTPUT_BYTES)
+        };
+        let requested_budget = input.max_output_bytes.unwrap_or(configured_budget);
+        let output_mode = input
+            .grep
+            .output_mode
+            .clone()
+            .unwrap_or(OutputMode::Content);
         let grep = GrepTool;
         let cwd = crate::types::tool_metadata::resolve_cwd(&ctx, &resources).await?;
         let call_id = xai_tool_protocol::ToolCallId::new_v7();
         let mut rt_ctx = xai_tool_runtime::ToolCallContext::new(call_id);
         rt_ctx.extensions.insert(resources.clone());
-        rt_ctx.extensions.insert(xai_tool_runtime::Cwd(cwd));
-        let mut result = xai_tool_runtime::Tool::run(&grep, rt_ctx, input)
-            .await
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("grep").expect("valid"),
-                    e.to_string(),
-                )
-            })?;
-
-        // Inject anchors only for content mode.
-        if matches!(output_mode, OutputMode::Content) && result.exit_code == 0 {
-            let cwd = crate::types::tool_metadata::resolve_cwd(&ctx, &resources).await?;
-            let (fs, scheme) = {
-                let res = resources.lock().await;
-                let fs = res
-                    .require::<crate::types::resources::FileSystem>()?
-                    .0
-                    .clone();
-                let params = res
-                    .get::<Params<HashlineSchemeParams>>()
-                    .cloned()
-                    .unwrap_or_default();
-                let scheme = params
-                    .0
-                    .build_scheme()
-                    .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
-                (fs, scheme)
-            };
-            match tokio::time::timeout(
-                Duration::from_secs(DEFAULT_ANCHOR_TIMEOUT_SECS),
-                inject_anchors(&result.stdout, &cwd, &*fs, &*scheme),
-            )
-            .await
-            {
-                Ok(anchored) => result.stdout = anchored,
-                Err(_elapsed) => {
-                    tracing::Span::current().record("timed_out", true);
-                    tracing::warn!(
-                        timeout_secs = DEFAULT_ANCHOR_TIMEOUT_SECS,
-                        "anchor injection timed out after {DEFAULT_ANCHOR_TIMEOUT_SECS}s, returning un-anchored results"
-                    );
-                    let warning = format!(
-                        "\nHashline anchoring for tool output failed after \
-                         {DEFAULT_ANCHOR_TIMEOUT_SECS} seconds. Since results lack \
-                         anchoring, please read the file before editing.\n"
-                    );
-                    result.stdout.extend_from_slice(warning.as_bytes());
+        rt_ctx.extensions.insert(xai_tool_runtime::Cwd(cwd.clone()));
+        let raw = match grep.run_raw_sorted(&rt_ctx, &input.grep).await? {
+            RawSortedGrepResult::Raw(raw) => raw,
+            RawSortedGrepResult::Early(out) => {
+                return Ok(enforce_stdout_budget(out, requested_budget));
+            }
+        };
+        let budget = input
+            .max_output_bytes
+            .unwrap_or(raw.default_max_output_bytes);
+        if !matches!(output_mode, OutputMode::Content) {
+            return Ok(enforce_stdout_budget(
+                raw.into_standard(&input.grep),
+                budget,
+            ));
+        }
+        let (raw_stdout, raw_truncated, max_matches) = if let Some(max_matches) = input.max_matches
+        {
+            (raw.stdout.as_slice(), raw.truncated, max_matches.min(2_000))
+        } else {
+            let (limited, cut) =
+                legacy_raw_line_limit(&raw.stdout, input.grep.head_limit.unwrap_or(200).min(2_000));
+            (limited, raw.truncated || cut, 2_000)
+        };
+        let (fs, scheme) = {
+            let res = resources.lock().await;
+            let fs = res
+                .require::<crate::types::resources::FileSystem>()?
+                .0
+                .clone();
+            let params = res
+                .get::<Params<HashlineSchemeParams>>()
+                .cloned()
+                .unwrap_or_default();
+            let scheme = params
+                .0
+                .build_scheme()
+                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
+            (fs, scheme)
+        };
+        let context = input.grep.context.filter(|&n| n > 0);
+        let before = input
+            .grep
+            .before_context
+            .filter(|&n| n > 0)
+            .or(context)
+            .unwrap_or(0);
+        let after = input
+            .grep
+            .after_context
+            .filter(|&n| n > 0)
+            .or(context)
+            .unwrap_or(0);
+        match tokio::time::timeout(
+            Duration::from_secs(DEFAULT_ANCHOR_TIMEOUT_SECS),
+            render_budgeted_content(
+                raw_stdout,
+                raw_truncated,
+                &cwd,
+                &raw.cwd_display,
+                &*fs,
+                &*scheme,
+                max_matches,
+                budget,
+                raw.max_chars_per_line,
+                before,
+                after,
+            ),
+        )
+        .await
+        {
+            Ok(mut result) => {
+                if !raw.stderr.is_empty() {
+                    if !result.stderr.is_empty() {
+                        result.stderr.push(b'\n');
+                    }
+                    result.stderr.extend_from_slice(&raw.stderr);
                 }
+                result.exit_code = raw.exit_code;
+                Ok(result)
+            }
+            Err(_) => {
+                tracing::Span::current().record("timed_out", true);
+                let notice = "Hashline anchoring timed out; read the file before editing.";
+                let stdout = if budget >= notice.len() {
+                    notice.as_bytes().to_vec()
+                } else if budget > 0 {
+                    b"!".to_vec()
+                } else {
+                    Vec::new()
+                };
+                Ok(GrepSearchOutput {
+                    stdout,
+                    stderr: raw.stderr,
+                    exit_code: -1,
+                    match_count: 0,
+                    file_matches: Vec::new(),
+                })
             }
         }
-
-        Ok(result)
     }
 }
 
@@ -355,6 +796,40 @@ mod tests {
         use crate::types::tool_metadata::ToolMetadata;
         let tool = HashlineGrepTool;
         assert!(ToolMetadata::description_template(&tool).contains("tools.by_kind.edit"));
+    }
+
+    #[test]
+    fn hashline_input_keeps_legacy_grep_fields_and_exposes_new_limits() {
+        let input: HashlineGrepInput = serde_json::from_value(serde_json::json!({
+            "pattern": "needle", "-B": 2, "head_limit": 7,
+            "max_matches": 3, "max_output_bytes": 256
+        }))
+        .unwrap();
+        assert_eq!(input.grep.pattern, "needle");
+        assert_eq!(input.grep.before_context, Some(2));
+        assert_eq!(input.grep.head_limit, Some(7));
+        assert_eq!(input.max_matches, Some(3));
+        assert_eq!(input.max_output_bytes, Some(256));
+        let schema = crate::registry::types::generate_schema::<HashlineGrepInput>();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap();
+        assert!(props.contains_key("pattern"));
+        assert!(props.contains_key("-B"));
+        assert!(props.contains_key("max_matches"));
+        assert!(props.contains_key("max_output_bytes"));
+    }
+
+    #[test]
+    fn legacy_head_limit_still_counts_raw_heading_and_context_lines() {
+        let raw = b"a.rs\n1-before\n2:needle\n3-after\n";
+        let (limited, truncated) = legacy_raw_line_limit(raw, 2);
+        assert_eq!(limited, b"a.rs\n1-before\n");
+        assert!(truncated);
+        let (full, truncated) = legacy_raw_line_limit(raw, 4);
+        assert_eq!(full, raw);
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -758,5 +1233,318 @@ mod tests {
             .filter(|l| l.matches(':').count() >= 3)
             .count();
         assert_eq!(anchored, 10);
+    }
+
+    async fn budgeted_fixture(
+        raw: &str,
+        root: &Path,
+        max_matches: usize,
+        budget: usize,
+        before: usize,
+        after: usize,
+    ) -> GrepSearchOutput {
+        use crate::computer::local::LocalFs;
+        render_budgeted_content(
+            raw.as_bytes(),
+            false,
+            root,
+            &root.display().to_string(),
+            &LocalFs,
+            &*test_scheme(),
+            max_matches,
+            budget,
+            1_000,
+            before,
+            after,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn budgeted_selection_sorts_files_before_limiting_matches() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "needle a\n").unwrap();
+        std::fs::write(tmp.path().join("z.rs"), "needle z\n").unwrap();
+        let forward = "a.rs\n1:needle a\n\nz.rs\n1:needle z\n";
+        let reverse = "z.rs\n1:needle z\n\na.rs\n1:needle a\n";
+        let a = budgeted_fixture(forward, tmp.path(), 1, 4_096, 0, 0).await;
+        let b = budgeted_fixture(reverse, tmp.path(), 1, 4_096, 0, 0).await;
+        assert_eq!(a.stdout, b.stdout);
+        assert_eq!(a.match_count, 1);
+        assert_eq!(a.file_matches.len(), 1);
+        assert_eq!(a.file_matches[0].path, "a.rs");
+        assert!(!String::from_utf8_lossy(&a.stdout).contains("needle z"));
+    }
+
+    #[tokio::test]
+    async fn budgeted_matches_are_separate_from_context_and_neighbours_are_unique() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("a.rs"),
+            "before\nneedle one\nneedle two\nafter\n",
+        )
+        .unwrap();
+        let raw = "a.rs\n1-before\n2:needle one\n3:needle two\n4-after\n";
+        let out = budgeted_fixture(raw, tmp.path(), 2, 4_096, 1, 1).await;
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(out.match_count, 2);
+        assert_eq!(out.file_matches[0].matches.len(), 2);
+        assert_eq!(stdout.matches("1:").count(), 1);
+        assert_eq!(stdout.matches("4:").count(), 1);
+        assert_eq!(stdout.matches("needle one").count(), 1);
+        assert_eq!(stdout.matches("needle two").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_counts_wrapper_paths_utf8_and_full_anchors() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let name = format!("{}中文.rs", "deep/".repeat(12));
+        let file = tmp.path().join(&name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "中文 needle\n中文 needle\n").unwrap();
+        let raw = format!("{name}\n1:中文 needle\n2:中文 needle\n");
+        let full = budgeted_fixture(&raw, tmp.path(), 2, usize::MAX, 0, 0).await;
+        let exact = budgeted_fixture(&raw, tmp.path(), 2, full.stdout.len(), 0, 0).await;
+        assert_eq!(full.stdout, exact.stdout);
+        let shorter = budgeted_fixture(&raw, tmp.path(), 2, full.stdout.len() - 1, 0, 0).await;
+        assert!(shorter.stdout.len() < full.stdout.len());
+        let text = String::from_utf8(shorter.stdout).unwrap();
+        for line in text
+            .lines()
+            .filter(|line| line.starts_with("1:") || line.starts_with("2:"))
+        {
+            assert!(line.matches(':').count() >= 3, "partial anchor: {line}");
+        }
+        assert_eq!(
+            shorter.match_count,
+            shorter
+                .file_matches
+                .iter()
+                .map(|f| f.matches.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[tokio::test]
+    async fn four_character_anchors_are_complete_at_exact_byte_limit() {
+        use crate::computer::local::LocalFs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
+        let scheme = HashlineSchemeParams {
+            hash_len: 4,
+            ..Default::default()
+        }
+        .build_scheme()
+        .unwrap();
+        let full = render_budgeted_content(
+            b"a.rs\n1:needle\n",
+            false,
+            tmp.path(),
+            &tmp.path().display().to_string(),
+            &LocalFs,
+            &*scheme,
+            1,
+            usize::MAX,
+            1_000,
+            0,
+            0,
+        )
+        .await;
+        let exact = render_budgeted_content(
+            b"a.rs\n1:needle\n",
+            false,
+            tmp.path(),
+            &tmp.path().display().to_string(),
+            &LocalFs,
+            &*scheme,
+            1,
+            full.stdout.len(),
+            1_000,
+            0,
+            0,
+        )
+        .await;
+        assert_eq!(full.stdout, exact.stdout);
+        let text = String::from_utf8(exact.stdout).unwrap();
+        let match_line = text.lines().find(|line| line.starts_with("1:")).unwrap();
+        let parts: Vec<_> = match_line.split(':').collect();
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn tiny_budget_never_emits_partial_utf8_or_inconsistent_match_metadata() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "中文 needle\n").unwrap();
+        for budget in 0..100 {
+            let out = budgeted_fixture("a.rs\n1:中文 needle\n", tmp.path(), 1, budget, 0, 0).await;
+            assert!(out.stdout.len() <= budget, "budget {budget}");
+            assert!(String::from_utf8(out.stdout).is_ok(), "budget {budget}");
+            assert_eq!(
+                out.match_count,
+                out.file_matches
+                    .iter()
+                    .map(|f| f.matches.len())
+                    .sum::<usize>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn budgeted_truncation_counts_hidden_matches() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "needle\nneedle\nneedle\n").unwrap();
+        let out = budgeted_fixture(
+            "a.rs\n1:needle\n2:needle\n3:needle\n",
+            tmp.path(),
+            2,
+            4_096,
+            0,
+            0,
+        )
+        .await;
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(out.match_count, 2);
+        assert!(text.contains("1 matching line omitted"), "{text}");
+        assert!(!text.contains("3:needle"));
+    }
+
+    #[tokio::test]
+    async fn raw_capture_truncation_reports_lower_bound_without_inventing_matches() {
+        use crate::computer::local::LocalFs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
+        let output = render_budgeted_content(
+            b"a.rs\n1:needle\n2:need",
+            true,
+            tmp.path(),
+            &tmp.path().display().to_string(),
+            &LocalFs,
+            &*test_scheme(),
+            10,
+            4_096,
+            1_000,
+            0,
+            0,
+        )
+        .await;
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.match_count, 1);
+        assert!(
+            text.contains("Showing 1 of at least 1 matching lines"),
+            "{text}"
+        );
+        assert!(text.contains("more matches may exist"), "{text}");
+        assert!(!text.contains("2:need"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn budgeted_tool_keeps_ignore_and_read_deny_boundaries() {
+        use crate::computer::local::LocalFs;
+        use crate::types::resources::{Cwd, DenyReadGlobs, FileSystem, Resources};
+        use crate::types::tool_metadata::test_ctx;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("safe.txt"), "needle safe\n").unwrap();
+        std::fs::write(tmp.path().join("ignored.txt"), "needle ignored\n").unwrap();
+        std::fs::write(tmp.path().join("secret.pem"), "needle secret\n").unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "ignored.txt\n").unwrap();
+        let mut resources = Resources::new();
+        resources.insert(Cwd(tmp.path().to_path_buf()));
+        resources.insert(FileSystem(Arc::new(LocalFs)));
+        resources.insert(DenyReadGlobs(vec!["**/*.pem".to_owned()]));
+        let input: HashlineGrepInput = serde_json::from_value(serde_json::json!({
+            "pattern": "needle", "max_matches": 10, "max_output_bytes": 4096
+        }))
+        .unwrap();
+        let output = xai_tool_runtime::Tool::run(
+            &HashlineGrepTool,
+            test_ctx(resources.into_shared()),
+            input,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.match_count, 1, "{stdout}");
+        assert!(stdout.contains("needle safe"), "{stdout}");
+        assert!(!stdout.contains("needle ignored"), "{stdout}");
+        assert!(!stdout.contains("needle secret"), "{stdout}");
+        assert_eq!(output.file_matches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn max_matches_overrides_legacy_head_limit_without_losing_hits_to_context() {
+        use crate::computer::local::LocalFs;
+        use crate::types::resources::{Cwd, FileSystem, Resources};
+        use crate::types::tool_metadata::test_ctx;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("a.rs"),
+            "before\nneedle one\nneedle two\nafter\n",
+        )
+        .unwrap();
+        let mut resources = Resources::new();
+        resources.insert(Cwd(tmp.path().to_path_buf()));
+        resources.insert(FileSystem(Arc::new(LocalFs)));
+        let input: HashlineGrepInput = serde_json::from_value(serde_json::json!({
+            "pattern": "needle", "head_limit": 1, "max_matches": 2,
+            "-C": 1, "max_output_bytes": 4096
+        }))
+        .unwrap();
+        let output = xai_tool_runtime::Tool::run(
+            &HashlineGrepTool,
+            test_ctx(resources.into_shared()),
+            input,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.match_count, 2, "{stdout}");
+        assert!(
+            stdout.contains("needle one") && stdout.contains("needle two"),
+            "{stdout}"
+        );
+        assert_eq!(stdout.matches("before").count(), 1);
+        assert_eq!(stdout.matches("after").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_path_error_respects_configured_stdout_budget() {
+        use crate::types::resources::{Cwd, Resources};
+        use crate::types::tool_metadata::test_ctx;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let mut resources = Resources::new();
+        resources.insert(Cwd(tmp.path().to_path_buf()));
+        resources.insert(Params(GrepParams {
+            max_output_bytes: Some(1),
+            max_chars_per_line: None,
+        }));
+        let input: HashlineGrepInput = serde_json::from_value(serde_json::json!({
+            "pattern": "needle", "path": "missing"
+        }))
+        .unwrap();
+        let output = xai_tool_runtime::Tool::run(
+            &HashlineGrepTool,
+            test_ctx(resources.into_shared()),
+            input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 2);
+        assert!(output.stdout.len() <= 1);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("budget is too small"));
+        assert_eq!(output.match_count, 0);
     }
 }

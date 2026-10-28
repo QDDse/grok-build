@@ -43,6 +43,8 @@ pub(crate) struct RgArgs<'a> {
     pub(crate) root: &'a Path,
     /// `--glob` values in order.
     pub(crate) globs: &'a [String],
+    /// Sort file paths before any caller-side result limit is applied.
+    pub(crate) sort_by_path: bool,
 }
 
 impl RgArgs<'_> {
@@ -55,6 +57,7 @@ impl RgArgs<'_> {
             output_mode,
             root,
             globs,
+            sort_by_path,
         } = self;
         let mut cmd = Command::new(program);
         cmd.arg("--heading")
@@ -64,6 +67,10 @@ impl RgArgs<'_> {
             .arg("--max-columns")
             .arg(MAX_COLUMNS.to_string())
             .arg("--max-columns-preview");
+
+        if sort_by_path {
+            cmd.arg("--sort").arg("path");
+        }
 
         if input.case_insensitive {
             cmd.arg("--ignore-case");
